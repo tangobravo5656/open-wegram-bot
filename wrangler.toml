@@ -5,3 +5,7 @@ keep_vars = true
 
 [placement]
 mode = "smart"
+
+[[kv_namespaces]]
+binding = "MESSAGE_MAP"
+id = "6caf926228b94b3aa07059be957244b0"
