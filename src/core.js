@@ -92,15 +92,36 @@ export async function handleWebhook(request, ownerUid, botToken, config) {
             if (mapped && mapped.targetChatId && mapped.targetMsgId) {
                 let method = null;
                 const payload = { chat_id: mapped.targetChatId, message_id: mapped.targetMsgId };
-                
+                let mediaType = null;
+                let mediaId = null;
+
+                // 1. 尝试判断它纯文字还是媒体
                 if (edited.text) {
                     method = 'editMessageText';
                     payload.text = edited.text;
                     if (edited.entities) payload.entities = edited.entities;
-                } else if (edited.caption !== undefined) {
-                    method = 'editMessageCaption';
-                    payload.caption = edited.caption;
-                    if (edited.caption_entities) payload.caption_entities = edited.caption_entities;
+                } else {
+                    if (edited.photo) {
+                        mediaType = 'photo';
+                        mediaId = edited.photo[edited.photo.length - 1].file_id; // 取最高清分辨率的图片
+                    } else if (edited.video) { mediaType = 'video'; mediaId = edited.video.file_id; }
+                    else if (edited.document) { mediaType = 'document'; mediaId = edited.document.file_id; }
+                    else if (edited.animation) { mediaType = 'animation'; mediaId = edited.animation.file_id; }
+                    else if (edited.audio) { mediaType = 'audio'; mediaId = edited.audio.file_id; }
+
+                    if (mediaType && mediaId) {
+                        method = 'editMessageMedia';
+                        payload.media = {
+                            type: mediaType,
+                            media: mediaId,
+                            caption: edited.caption || '',
+                            caption_entities: edited.caption_entities
+                        };
+                    } else if (edited.caption !== undefined) {
+                        method = 'editMessageCaption';
+                        payload.caption = edited.caption;
+                        if (edited.caption_entities) payload.caption_entities = edited.caption_entities;
+                    }
                 }
 
                 if (chatId !== ownerUid) { // 发送自用户 -> 管理员，需要挂载发件人信息
@@ -108,7 +129,36 @@ export async function handleWebhook(request, ownerUid, botToken, config) {
                     payload.reply_markup = { inline_keyboard: [[{ text: `🔓 From: ${sn} (${chatId})`, url: `tg://user?id=${chatId}` }]] };
                 }
 
-                if (method) await postToTelegramApi(botToken, method, payload);
+                if (method) {
+                    const editResp = await postToTelegramApi(botToken, method, payload);
+                    const editResJson = await editResp.json();
+                    
+                    // 如果编辑失败 (例如: Telegram 不允许直接把 "纯文字消息" edit 成 "图片消息")
+                    // 我们直接执行优雅降级：删除旧的纯文本消息，重新 Copy 这条带图片的全新消息过去！
+                    if (!editResJson.ok) {
+                        await postToTelegramApi(botToken, 'deleteMessage', { 
+                            chat_id: mapped.targetChatId, 
+                            message_id: mapped.targetMsgId 
+                        });
+                        
+                        const copyPayload = {
+                            chat_id: mapped.targetChatId,
+                            from_chat_id: chatId,
+                            message_id: msgId
+                        };
+                        if (chatId !== ownerUid) copyPayload.reply_markup = payload.reply_markup;
+                        
+                        const copyResp = await postToTelegramApi(botToken, 'copyMessage', copyPayload);
+                        const copyResJson = await copyResp.json();
+                        // 覆盖保存新的映射ID，以防后续他又修改了图片
+                        if (copyResJson.ok && copyResJson.result) {
+                            await config.MESSAGE_MAP.put(`msg:${chatId}:${msgId}`, JSON.stringify({
+                                targetChatId: mapped.targetChatId,
+                                targetMsgId: copyResJson.result.message_id
+                            }), {expirationTtl: 172800});
+                        }
+                    }
+                }
             }
         } catch(e) { console.error('Map parsing error', e); }
         return new Response('OK');
