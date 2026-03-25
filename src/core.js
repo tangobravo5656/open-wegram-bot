@@ -37,7 +37,7 @@ export async function handleInstall(request, ownerUid, botToken, prefix, secretT
     try {
         const response = await postToTelegramApi(botToken, 'setWebhook', {
             url: webhookUrl,
-            allowed_updates: ['message'],
+            allowed_updates: ['message', 'edited_message'],
             secret_token: secretToken
         });
 
@@ -74,12 +74,46 @@ export async function handleUninstall(botToken, secretToken) {
     }
 }
 
-export async function handleWebhook(request, ownerUid, botToken, secretToken) {
-    if (secretToken !== request.headers.get('X-Telegram-Bot-Api-Secret-Token')) {
+export async function handleWebhook(request, ownerUid, botToken, config) {
+    if (config.secretToken !== request.headers.get('X-Telegram-Bot-Api-Secret-Token')) {
         return new Response('Unauthorized', {status: 401});
     }
 
     const update = await request.json();
+
+    // 监听消息编辑
+    if (update.edited_message) {
+        if (!config.MESSAGE_MAP) return new Response('OK'); // 如果没有配置 KV，则直接忽略
+        const edited = update.edited_message;
+        const chatId = edited.chat.id.toString();
+        const msgId = edited.message_id;
+        try {
+            const mapped = await config.MESSAGE_MAP.get(`msg:${chatId}:${msgId}`, "json");
+            if (mapped && mapped.targetChatId && mapped.targetMsgId) {
+                let method = null;
+                const payload = { chat_id: mapped.targetChatId, message_id: mapped.targetMsgId };
+                
+                if (edited.text) {
+                    method = 'editMessageText';
+                    payload.text = edited.text;
+                    if (edited.entities) payload.entities = edited.entities;
+                } else if (edited.caption !== undefined) {
+                    method = 'editMessageCaption';
+                    payload.caption = edited.caption;
+                    if (edited.caption_entities) payload.caption_entities = edited.caption_entities;
+                }
+
+                if (chatId !== ownerUid) { // 发送自用户 -> 管理员，需要挂载发件人信息
+                    const sn = edited.chat.username ? `@${edited.chat.username}` : [edited.chat.first_name, edited.chat.last_name].filter(Boolean).join(' ');
+                    payload.reply_markup = { inline_keyboard: [[{ text: `🔓 From: ${sn} (${chatId})`, url: `tg://user?id=${chatId}` }]] };
+                }
+
+                if (method) await postToTelegramApi(botToken, method, payload);
+            }
+        } catch(e) { console.error('Map parsing error', e); }
+        return new Response('OK');
+    }
+
     if (!update.message) {
         return new Response('OK');
     }
@@ -95,11 +129,23 @@ export async function handleWebhook(request, ownerUid, botToken, secretToken) {
                     senderUid = rm.inline_keyboard[0][0].url.split('tg://user?id=')[1];
                 }
 
-                await postToTelegramApi(botToken, 'copyMessage', {
+                const response = await postToTelegramApi(botToken, 'copyMessage', {
                     chat_id: parseInt(senderUid),
                     from_chat_id: message.chat.id,
                     message_id: message.message_id
                 });
+                
+                if (config.MESSAGE_MAP) {
+                    try {
+                        const result = await response.json();
+                        if (result.ok && result.result) {
+                            await config.MESSAGE_MAP.put(`msg:${ownerUid}:${message.message_id}`, JSON.stringify({
+                                targetChatId: parseInt(senderUid),
+                                targetMsgId: result.result.message_id
+                            }), {expirationTtl: 172800});
+                        }
+                    } catch(e) {}
+                }
             }
 
             return new Response('OK');
@@ -132,9 +178,21 @@ export async function handleWebhook(request, ownerUid, botToken, secretToken) {
             });
         }
 
-        const response = await copyMessage(true);
+        let response = await copyMessage(true);
         if (!response.ok) {
-            await copyMessage();
+            response = await copyMessage();
+        }
+
+        if (config.MESSAGE_MAP && response.ok) {
+            try {
+                const result = await response.json();
+                if (result.ok && result.result) {
+                    await config.MESSAGE_MAP.put(`msg:${senderUid}:${message.message_id}`, JSON.stringify({
+                        targetChatId: parseInt(ownerUid),
+                        targetMsgId: result.result.message_id
+                    }), {expirationTtl: 172800});
+                }
+            } catch(e) {}
         }
 
         return new Response('OK');
@@ -165,7 +223,7 @@ export async function handleRequest(request, config) {
     }
 
     if (match = path.match(WEBHOOK_PATTERN)) {
-        return handleWebhook(request, match[1], match[2], secretToken);
+        return handleWebhook(request, match[1], match[2], config);
     }
 
     return new Response('Not Found', {status: 404});

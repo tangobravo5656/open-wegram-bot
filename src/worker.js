@@ -11,7 +11,8 @@ export default {
     async fetch(request, env, ctx) {
         const config = {
             prefix: env.PREFIX || 'public',
-            secretToken: env.SECRET_TOKEN || ''
+            secretToken: env.SECRET_TOKEN || '',
+            MESSAGE_MAP: env.MESSAGE_MAP || null
         };
 
         return handleRequest(request, config);
